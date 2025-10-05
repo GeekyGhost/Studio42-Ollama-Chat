@@ -13,3 +13,12 @@ soundfile>=0.12.1
 
 # Numerical operations (for TTS audio concatenation)
 numpy>=1.24.0
+
+# Audio processing (for Opus encoding)
+pydub>=0.25.1
+
+# NOTE: pydub requires ffmpeg to be installed on your system
+# Install ffmpeg:
+#   Windows: Download from https://ffmpeg.org/download.html or use: choco install ffmpeg
+#   Mac: brew install ffmpeg
+#   Linux: sudo apt-get install ffmpeg

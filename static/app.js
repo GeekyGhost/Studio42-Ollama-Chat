@@ -1,5 +1,5 @@
 // Studio 42 - Ollama Chat Interface
-// Frontend Application Logic with TTS and STT
+// Frontend Application Logic with Streaming TTS and STT
 
 // State management
 let conversations = [{ id: 1, title: 'New Chat', messages: [] }];
@@ -33,7 +33,65 @@ let soundsEnabled = true;
 let soundsInitialized = false;
 const sounds = {};
 
-// Initialize sounds after user interaction (browser autoplay policy)
+// ==================== STREAMING TTS PLAYER ====================
+
+class StreamingTTSPlayer {
+    constructor() {
+        this.audioQueue = [];
+        this.isPlaying = false;
+        this.currentAudio = null;
+    }
+    
+    async playNext() {
+        if (this.audioQueue.length === 0) {
+            this.isPlaying = false;
+            console.log('✓ TTS playback complete');
+            return;
+        }
+        
+        this.isPlaying = true;
+        const audioData = this.audioQueue.shift();
+        
+        this.currentAudio = new Audio(audioData);
+        this.currentAudio.onended = () => this.playNext();
+        this.currentAudio.onerror = (e) => {
+            console.error('Audio playback error:', e);
+            this.playNext();
+        };
+        
+        try {
+            await this.currentAudio.play();
+        } catch (err) {
+            console.error('Failed to play audio chunk:', err);
+            this.playNext();
+        }
+    }
+    
+    addChunk(audioData) {
+        this.audioQueue.push(audioData);
+        if (!this.isPlaying) {
+            this.playNext();
+        }
+    }
+    
+    stop() {
+        this.audioQueue = [];
+        if (this.currentAudio) {
+            this.currentAudio.pause();
+            this.currentAudio = null;
+        }
+        this.isPlaying = false;
+    }
+    
+    getQueueLength() {
+        return this.audioQueue.length;
+    }
+}
+
+const ttsPlayer = new StreamingTTSPlayer();
+
+// ==================== SOUND EFFECTS ====================
+
 function initializeSounds() {
     if (soundsInitialized) return;
     
@@ -43,12 +101,10 @@ function initializeSounds() {
         sounds.error = new Audio('/static/sounds/error.wav');
         sounds.success = new Audio('/static/sounds/success.ogg');
         
-        // Configure each sound
         Object.keys(sounds).forEach(key => {
             sounds[key].preload = 'auto';
             sounds[key].volume = 0.3;
             
-            // Test load
             sounds[key].addEventListener('error', (e) => {
                 console.error(`Failed to load sound: ${key}`, e);
             });
@@ -68,7 +124,6 @@ function initializeSounds() {
 function playSound(soundName) {
     if (!soundsEnabled) return;
     
-    // Initialize sounds on first use (browser autoplay policy requirement)
     if (!soundsInitialized) {
         initializeSounds();
     }
@@ -80,10 +135,8 @@ function playSound(soundName) {
     }
     
     try {
-        // Clone the audio to allow overlapping sounds
         const soundClone = sound.cloneNode();
         soundClone.volume = sound.volume;
-        
         soundClone.play().catch(err => {
             console.warn(`Sound playback failed for ${soundName}:`, err.message);
         });
@@ -101,11 +154,6 @@ function toggleSounds(enabled) {
     }
 }
 
-function testSound() {
-    console.log('Testing sound: beep.wav');
-    playSound('beep');
-}
-
 function toggleTTS(enabled) {
     ttsEnabled = enabled;
     const ttsSettings = document.getElementById('ttsSettings');
@@ -114,7 +162,7 @@ function toggleTTS(enabled) {
     }
     
     if (enabled && !ttsAvailable) {
-        alert('⚠️ TTS not available. Install with:\npip install kokoro soundfile');
+        alert('⚠️ TTS not available. Install with:\npip install kokoro soundfile pydub');
         const ttsEnabledCheckbox = document.getElementById('ttsEnabled');
         if (ttsEnabledCheckbox) ttsEnabledCheckbox.checked = false;
         ttsEnabled = false;
@@ -133,13 +181,12 @@ function toggleThinking(thinkId) {
     }
 }
 
-// Make functions globally available for onclick handlers
+// Make functions globally available
 window.toggleSounds = toggleSounds;
 window.toggleTTS = toggleTTS;
 window.toggleThinking = toggleThinking;
-window.testSound = testSound;
 
-// DOM Elements - will be initialized after DOM loads
+// DOM Elements
 let statusBadge, modelSelect, visionBadge, conversationList, messagesContainer;
 let messageInput, sendBtn, newChatBtn, settingsBtn, settingsPanel;
 let imageInput, imageUploadBtn, imagePreview, previewImage, removeImageBtn, micBtn;
@@ -159,7 +206,6 @@ document.addEventListener('DOMContentLoaded', () => {
     initSpeechRecognition();
     renderConversations();
     
-    // Initialize sounds on first user interaction
     document.addEventListener('click', initializeSounds, { once: true });
     
     console.log('✓ Initialization complete');
@@ -200,7 +246,6 @@ function initializeDOMElements() {
 // ==================== MESSAGE PARSING ====================
 
 function parseThinkingContent(text) {
-    // Parse <think>...</think> tags from the response
     const thinkRegex = /<think>([\s\S]*?)<\/think>/g;
     const thoughts = [];
     let match;
@@ -273,7 +318,7 @@ async function checkTTSStatus() {
             console.log('⚠ TTS not available');
             if (ttsEnabledCheckbox) {
                 ttsEnabledCheckbox.disabled = true;
-                ttsEnabledCheckbox.parentElement.title = 'TTS not installed (pip install kokoro soundfile)';
+                ttsEnabledCheckbox.parentElement.title = 'TTS not installed (pip install kokoro soundfile pydub)';
             }
         }
     } catch (error) {
@@ -326,15 +371,11 @@ function setupTTSListeners() {
 }
 
 function cleanTextForTTS(text) {
-    /**
-     * Clean text for better TTS output
-     * Removes markdown formatting and converts lists to natural sentences
-     */
     return text
-        .replace(/\*\*/g, '')  // Remove bold markers
-        .replace(/\n\d+\.\s+/g, '. ')  // Convert numbered lists to sentences
-        .replace(/\n+/g, '. ')  // Convert newlines to periods
-        .replace(/\s+/g, ' ')  // Normalize whitespace
+        .replace(/\*\*/g, '')
+        .replace(/\n\d+\.\s+/g, '. ')
+        .replace(/\n+/g, '. ')
+        .replace(/\s+/g, ' ')
         .trim();
 }
 
@@ -342,16 +383,14 @@ async function speakText(text) {
     if (!ttsEnabled || !ttsAvailable || !text) return;
     
     // Stop any currently playing audio
-    if (currentAudio) {
-        currentAudio.pause();
-        currentAudio = null;
-    }
+    ttsPlayer.stop();
     
     try {
-        // Clean the text for TTS (this is now redundant as server also cleans, but keeps it consistent)
         const cleanedText = cleanTextForTTS(text);
         
-        const response = await fetch('/api/tts/speak', {
+        console.log(`🎤 Starting TTS stream for ${cleanedText.length} chars...`);
+        
+        const response = await fetch('/api/tts/speak/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -365,16 +404,46 @@ async function speakText(text) {
             throw new Error(`TTS failed: ${response.statusText}`);
         }
         
-        const data = await response.json();
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
         
-        if (data.audio) {
-            currentAudio = new Audio(data.audio);
-            currentAudio.play().catch(err => {
-                console.error('Audio playback failed:', err);
-            });
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        
+                        if (data.error) {
+                            console.error('TTS streaming error:', data.error);
+                            break;
+                        }
+                        
+                        if (data.chunk) {
+                            // Add Opus audio chunk to queue for immediate playback
+                            ttsPlayer.addChunk(`data:audio/ogg;base64,${data.chunk}`);
+                            console.log(`🔊 TTS chunk ${data.index} queued (queue: ${ttsPlayer.getQueueLength()})`);
+                        }
+                        
+                        if (data.done) {
+                            console.log(`✓ TTS streaming complete: ${data.total_chunks} chunks`);
+                        }
+                    } catch (e) {
+                        console.error('Failed to parse TTS chunk:', e);
+                    }
+                }
+            }
         }
+        
     } catch (error) {
-        console.error('TTS error:', error);
+        console.error('TTS streaming error:', error);
     }
 }
 
@@ -752,7 +821,6 @@ function renderMessages() {
             imageHtml = `<img src="${msg.image}" class="message-image" alt="uploaded">`;
         }
 
-        // Parse thinking content
         let thinkingHtml = '';
         let messageContent = msg.content;
         
@@ -893,10 +961,9 @@ async function sendMessage() {
             currentConv.messages.push(assistantMessage);
             console.log('✓ Response received');
             
-            // Play success sound
             playSound('success');
             
-            // Only speak the actual content (not the thinking)
+            // Speak the content (not thinking tags)
             if (ttsEnabled && autoPlayResponses) {
                 const parsed = parseThinkingContent(assistantMessage.content);
                 if (parsed.content) {

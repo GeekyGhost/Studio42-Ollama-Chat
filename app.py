@@ -16,9 +16,6 @@ import numpy as np
 import re
 
 # Suppress warnings from Kokoro TTS library (upstream issues)
-# These warnings come from inside the Kokoro library's neural network code:
-# 1. Dropout warning: Kokoro's model has dropout=0.2 but num_layers=1 (dropout does nothing with 1 layer)
-# 2. weight_norm warning: Kokoro uses deprecated PyTorch API (they need to update their code)
 warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.modules.rnn')
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.nn.utils.weight_norm')
 
@@ -26,13 +23,15 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='torch.nn.utils
 try:
     from kokoro import KPipeline
     import soundfile as sf
+    from pydub import AudioSegment
     TTS_AVAILABLE = True
     logger = logging.getLogger(__name__)
     logger.info("Kokoro TTS loaded successfully")
-except ImportError:
+except ImportError as e:
     TTS_AVAILABLE = False
     logger = logging.getLogger(__name__)
-    logger.warning("Kokoro TTS not available. Install with: pip install kokoro soundfile")
+    logger.warning(f"TTS not available: {e}")
+    logger.warning("Install with: pip install kokoro soundfile pydub")
 
 # Configure logging
 logging.basicConfig(
@@ -50,7 +49,6 @@ OLLAMA_BASE_URL = 'http://localhost:11434'
 tts_pipeline = None
 if TTS_AVAILABLE:
     try:
-        # Explicitly specify repo_id to avoid warning (proper fix, not suppression)
         tts_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
         logger.info("TTS pipeline initialized")
     except Exception as e:
@@ -349,11 +347,74 @@ def clean_text_for_tts(text):
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
+@app.route('/api/tts/speak/stream', methods=['POST'])
+def speak_stream():
+    """Stream TTS audio chunks as they're generated using Opus codec"""
+    if not TTS_AVAILABLE:
+        return jsonify({'error': 'TTS not available. Install: pip install kokoro soundfile pydub'}), 503
+    
+    try:
+        data = request.json
+        text = data.get('text', '').strip()
+        voice = data.get('voice', 'af_bella')
+        speed = float(data.get('speed', 1.0))
+        
+        if not text:
+            return jsonify({'error': 'No text provided'}), 400
+        
+        if len(text) > 5000:
+            return jsonify({'error': 'Text too long (max 5000 characters)'}), 400
+        
+        # Clean text for better TTS output
+        text = clean_text_for_tts(text)
+        
+        logger.info(f"TTS streaming request: {len(text)} chars, voice={voice}, speed={speed}")
+        
+        def generate_audio_stream():
+            """Stream audio chunks as Opus-encoded base64 data"""
+            try:
+                generator = tts_pipeline(text, voice=voice, speed=speed)
+                
+                chunk_index = 0
+                for _, _, audio_chunk in generator:
+                    # Convert numpy array to AudioSegment
+                    audio_bytes = (audio_chunk.numpy() * 32767).astype(np.int16).tobytes()
+                    audio_segment = AudioSegment(
+                        data=audio_bytes,
+                        sample_width=2,
+                        frame_rate=24000,
+                        channels=1
+                    )
+                    
+                    # Export as Opus (much smaller than WAV)
+                    buffer = io.BytesIO()
+                    audio_segment.export(buffer, format='opus', bitrate='64k')
+                    buffer.seek(0)
+                    
+                    # Encode as base64 and stream
+                    chunk_b64 = base64.b64encode(buffer.read()).decode('utf-8')
+                    yield f"data: {json.dumps({'chunk': chunk_b64, 'index': chunk_index})}\n\n"
+                    chunk_index += 1
+                
+                # Send completion event
+                yield f"data: {json.dumps({'done': True, 'total_chunks': chunk_index})}\n\n"
+                logger.info(f"TTS streaming complete: {chunk_index} chunks")
+                
+            except Exception as e:
+                logger.error(f"TTS streaming error: {e}", exc_info=True)
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        
+        return Response(generate_audio_stream(), mimetype='text/event-stream')
+        
+    except Exception as e:
+        logger.error(f"TTS stream error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/tts/speak', methods=['POST'])
 def speak():
-    """Convert text to speech using Kokoro TTS"""
+    """Convert text to speech using Kokoro TTS (non-streaming fallback)"""
     if not TTS_AVAILABLE:
-        return jsonify({'error': 'TTS not available. Install: pip install kokoro soundfile'}), 503
+        return jsonify({'error': 'TTS not available. Install: pip install kokoro soundfile pydub'}), 503
     
     try:
         data = request.json
@@ -375,27 +436,36 @@ def speak():
         # Generate audio using Kokoro
         generator = tts_pipeline(text, voice=voice, speed=speed)
         
-        # Kokoro returns a generator - collect ALL audio chunks
+        # Collect all audio chunks
         audio_chunks = []
         for _, _, audio in generator:
-            audio_chunks.append(audio)
+            audio_chunks.append(audio.numpy())
         
         if not audio_chunks:
             return jsonify({'error': 'Failed to generate audio'}), 500
         
-        # Concatenate all audio chunks into one array
+        # Concatenate all audio chunks
         audio_data = np.concatenate(audio_chunks)
         
-        # Convert to WAV format and encode as base64
+        # Convert to AudioSegment
+        audio_bytes = (audio_data * 32767).astype(np.int16).tobytes()
+        audio_segment = AudioSegment(
+            data=audio_bytes,
+            sample_width=2,
+            frame_rate=24000,
+            channels=1
+        )
+        
+        # Export as Opus
         buffer = io.BytesIO()
-        sf.write(buffer, audio_data, 24000, format='WAV')
+        audio_segment.export(buffer, format='opus', bitrate='64k')
         buffer.seek(0)
         audio_base64 = base64.b64encode(buffer.read()).decode('utf-8')
         
         logger.info(f"TTS generated: {len(audio_data) / 24000:.2f}s of audio")
         
         return jsonify({
-            'audio': f'data:audio/wav;base64,{audio_base64}',
+            'audio': f'data:audio/ogg;base64,{audio_base64}',
             'voice': voice,
             'duration': len(audio_data) / 24000,
             'text_length': len(text)
@@ -462,7 +532,7 @@ def initialize_app():
         if TTS_AVAILABLE:
             logger.info("✓ Kokoro TTS is available")
         else:
-            logger.warning("⚠ Kokoro TTS not available (install: pip install kokoro soundfile)")
+            logger.warning("⚠ Kokoro TTS not available (install: pip install kokoro soundfile pydub)")
         
         try:
             response = requests.get(f'{OLLAMA_BASE_URL}/api/tags', timeout=3)
@@ -496,10 +566,10 @@ if __name__ == '__main__':
         print("  ✓ Image upload for vision models")
         print("  ✓ Adjustable generation parameters")
         if TTS_AVAILABLE:
-            print("  ✓ Text-to-Speech (Kokoro-82M)")
+            print("  ✓ Text-to-Speech (Kokoro-82M) with streaming")
             print("  ✓ Speech-to-Text (Web Speech API)")
         else:
-            print("  ⚠ TTS disabled (install: pip install kokoro soundfile)")
+            print("  ⚠ TTS disabled (install: pip install kokoro soundfile pydub)")
         print("  ✓ LCARS-inspired UI from Star Trek")
         print("\nServer running at: http://127.0.0.1:5000")
         print("\nMake sure Ollama is running:")
