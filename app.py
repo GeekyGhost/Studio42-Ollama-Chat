@@ -12,6 +12,8 @@ from pathlib import Path
 import io
 import base64
 import warnings
+import numpy as np
+import re
 
 # Suppress warnings from Kokoro TTS library (upstream issues)
 # These warnings come from inside the Kokoro library's neural network code:
@@ -335,9 +337,21 @@ def list_voices():
     
     return jsonify({'voices': voices})
 
+def clean_text_for_tts(text):
+    """Clean text for better TTS output"""
+    # Remove markdown bold markers
+    text = re.sub(r'\*\*', '', text)
+    # Convert numbered lists to sentences
+    text = re.sub(r'\n\d+\.\s+', '. ', text)
+    # Convert multiple newlines to periods
+    text = re.sub(r'\n+', '. ', text)
+    # Remove extra spaces
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
 @app.route('/api/tts/speak', methods=['POST'])
 def speak():
-    """Convert text to speech using Kokoro TTS - IMPROVED VERSION"""
+    """Convert text to speech using Kokoro TTS"""
     if not TTS_AVAILABLE:
         return jsonify({'error': 'TTS not available. Install: pip install kokoro soundfile'}), 503
     
@@ -350,54 +364,41 @@ def speak():
         if not text:
             return jsonify({'error': 'No text provided'}), 400
         
-        # IMPROVED: Increased limit and better handling
-        max_chars = 10000  # Increased from 5000
-        original_length = len(text)
+        if len(text) > 5000:
+            return jsonify({'error': 'Text too long (max 5000 characters)'}), 400
         
-        if len(text) > max_chars:
-            logger.warning(f'Text truncated: {original_length} → {max_chars} chars')
-            text = text[:max_chars]
+        # Clean text for better TTS output
+        text = clean_text_for_tts(text)
         
         logger.info(f"TTS request: {len(text)} chars, voice={voice}, speed={speed}")
         
         # Generate audio using Kokoro
-        try:
-            generator = tts_pipeline(text, voice=voice, speed=speed)
-            
-            # Kokoro returns a generator, get the audio from it
-            audio_data = None
-            for _, _, audio in generator:
-                audio_data = audio
-                break
-            
-            if audio_data is None:
-                raise ValueError('Kokoro generator returned no audio data')
-            
-        except Exception as e:
-            logger.error(f"Kokoro generation failed: {e}", exc_info=True)
-            return jsonify({'error': f'TTS generation failed: {str(e)}'}), 500
+        generator = tts_pipeline(text, voice=voice, speed=speed)
+        
+        # Kokoro returns a generator - collect ALL audio chunks
+        audio_chunks = []
+        for _, _, audio in generator:
+            audio_chunks.append(audio)
+        
+        if not audio_chunks:
+            return jsonify({'error': 'Failed to generate audio'}), 500
+        
+        # Concatenate all audio chunks into one array
+        audio_data = np.concatenate(audio_chunks)
         
         # Convert to WAV format and encode as base64
         buffer = io.BytesIO()
-        try:
-            sf.write(buffer, audio_data, 24000, format='WAV')
-        except Exception as e:
-            logger.error(f"Audio encoding failed: {e}")
-            return jsonify({'error': 'Failed to encode audio'}), 500
-        
+        sf.write(buffer, audio_data, 24000, format='WAV')
         buffer.seek(0)
         audio_base64 = base64.b64encode(buffer.read()).decode('utf-8')
         
-        duration = len(audio_data) / 24000
-        logger.info(f"TTS generated: {duration:.2f}s audio for {len(text)} chars")
+        logger.info(f"TTS generated: {len(audio_data) / 24000:.2f}s of audio")
         
         return jsonify({
             'audio': f'data:audio/wav;base64,{audio_base64}',
             'voice': voice,
-            'duration': duration,
-            'text_length': len(text),
-            'original_length': original_length,
-            'truncated': original_length > max_chars
+            'duration': len(audio_data) / 24000,
+            'text_length': len(text)
         })
     
     except Exception as e:
